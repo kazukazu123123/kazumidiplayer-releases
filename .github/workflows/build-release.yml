@@ -1,0 +1,145 @@
+name: Build and publish release
+
+# Triggered by a push to the build-trigger branch (sent by the
+# kazumidiplayer repository on every non-bump push to its main) or
+# manually with a kazumidiplayer commit SHA. Builds Windows, Linux and
+# macOS (universal) binaries from the private source repositories and
+# publishes them here as a release. Only the newest release is kept.
+
+on:
+  push:
+    branches: [build-trigger]
+  workflow_dispatch:
+    inputs:
+      player_sha:
+        description: kazumidiplayer commit SHA to build
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows
+            os: windows-latest
+            built: src/target/release/kazumidiplayer.exe
+            asset: kazumidiplayer-windows-x64.exe
+          - name: linux
+            os: ubuntu-latest
+            built: src/target/release/kazumidiplayer
+            asset: kazumidiplayer-linux-x64
+          - name: macos
+            os: macos-latest
+            built: src/kazumidiplayer-macos-universal
+            asset: kazumidiplayer-macos-universal
+    outputs:
+      player_sha: ${{ steps.parse.outputs.player_sha }}
+      short: ${{ steps.parse.outputs.short }}
+    steps:
+      - name: Parse trigger commit
+        id: parse
+        shell: bash
+        env:
+          HEAD_MESSAGE: ${{ github.event.head_commit.message }}
+          INPUT_SHA: ${{ inputs.player_sha }}
+        run: |
+          if [ -n "$INPUT_SHA" ]; then
+            SHA="$INPUT_SHA"
+          else
+            SHA="$(printf '%s' "$HEAD_MESSAGE" | head -n 1 | sed 's/^build //')"
+          fi
+          echo "player_sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "short=$(printf '%s' "$SHA" | cut -c1-7)" >> "$GITHUB_OUTPUT"
+      - name: Check out kazumidiplayer
+        uses: actions/checkout@v4
+        with:
+          repository: kazukazu123123/kazumidiplayer
+          ref: ${{ steps.parse.outputs.player_sha }}
+          ssh-key: ${{ secrets.PLAYER_READ_KEY }}
+          path: src
+      - name: Read kazumidiparser-rs pin
+        id: pins
+        shell: bash
+        run: echo "rs_sha=$(git -C src ls-tree HEAD vendor/kazumidiparser-rs | awk '{print $3}')" >> "$GITHUB_OUTPUT"
+      - name: Check out kazumidiparser-rs
+        uses: actions/checkout@v4
+        with:
+          repository: kazukazu123123/kazumidiparser-rs
+          ref: ${{ steps.pins.outputs.rs_sha }}
+          ssh-key: ${{ secrets.RS_READ_KEY }}
+          path: src/vendor/kazumidiparser-rs
+      - name: Read kazumidiparser (C) pin
+        id: cpins
+        shell: bash
+        run: echo "c_sha=$(git -C src/vendor/kazumidiparser-rs ls-tree HEAD kazumidiparser-c | awk '{print $3}')" >> "$GITHUB_OUTPUT"
+      - name: Check out kazumidiparser (C)
+        uses: actions/checkout@v4
+        with:
+          repository: kazukazu123123/kazumidiparser
+          ref: ${{ steps.cpins.outputs.c_sha }}
+          ssh-key: ${{ secrets.C_READ_KEY }}
+          path: src/vendor/kazumidiparser-rs/kazumidiparser-c
+      - name: Install Linux build dependencies
+        if: matrix.name == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libgtk-3-dev libx11-dev libxrandr-dev libxi-dev libxcursor-dev libxinerama-dev libgl1-mesa-dev
+      - name: Build (Windows / Linux)
+        if: matrix.name != 'macos'
+        working-directory: src
+        run: cargo build --release
+      - name: Build (macOS universal)
+        if: matrix.name == 'macos'
+        working-directory: src
+        run: |
+          rustup target add x86_64-apple-darwin aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+          cargo build --release --target aarch64-apple-darwin
+          lipo -create -output kazumidiplayer-macos-universal target/x86_64-apple-darwin/release/kazumidiplayer target/aarch64-apple-darwin/release/kazumidiplayer
+      - name: Stage artifact
+        shell: bash
+        run: cp "${{ matrix.built }}" "${{ matrix.asset }}"
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.name }}
+          path: ${{ matrix.asset }}
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create release and prune old ones
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_MESSAGE: ${{ github.event.head_commit.message }}
+          SHA: ${{ needs.build.outputs.player_sha }}
+          SHORT: ${{ needs.build.outputs.short }}
+        run: |
+          NOTES="$(printf '%s' "$HEAD_MESSAGE" | tail -n +3)"
+          if [ -z "$NOTES" ]; then NOTES="Build of kazumidiplayer@$SHA"; fi
+          printf '%s\n' "$NOTES" > notes.txt
+          gh release delete "$SHORT" --repo kazukazu123123/kazumidiplayer-releases --cleanup-tag --yes || true
+          gh release create "$SHORT" --repo kazukazu123123/kazumidiplayer-releases --title "KazuMIDIPlayer $SHORT" --notes-file notes.txt dist/kazumidiplayer-windows-x64.exe dist/kazumidiplayer-linux-x64 dist/kazumidiplayer-macos-universal
+          gh release list --repo kazukazu123123/kazumidiplayer-releases --json tagName --jq '.[].tagName' | while read -r tag; do
+            if [ "$tag" != "$SHORT" ]; then
+              gh release delete "$tag" --repo kazukazu123123/kazumidiplayer-releases --cleanup-tag --yes
+            fi
+          done
